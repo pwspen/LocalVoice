@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Tuple, List
 import queue
 from time import perf_counter
-# from langchain.chat_models import ChatOpenAI, ChatOllama
 from langchain_community.chat_models import ChatOllama, ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationChain

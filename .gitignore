@@ -2,4 +2,5 @@ models/*
 demo/*
 fp16/*
 voices/*
+__pycache__/
 

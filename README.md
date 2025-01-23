@@ -1,11 +1,24 @@
 # TODO
-- [ ] Sentence chunking
+- [ ] TTS sentence chunking
 - [ ] Interrupt detection
 - [ ] Tool use (PydanticAI)
 - [ ] LLaSa integration (any voice, any persona)
-- [ ] VLLM / YOLO integration
-- [ ] Spin up background agents (API is fine, latency doesn't matter)
+- [ ] vision LLM / YOLO integration
 - [ ] Biasing voice with emotion
+- [ ] OpenHands CLI integration
+- [ ] Life / goals coach module
 
+- [ ] Wake word, conversation end modes
+- [ ] Cache warming modes
+- [ ] Avg latency auto tests
+- [ ] Audio preprocessing/filtering
+- [ ] Visual interface - openwebui?
+- [ ] ez well tested install script
 
 VAD + Whisper + Kokoro + Llama 8b is only 10 gigs, llama 8b being 5 of them. There's definitely room for LLasa plus whatever other fun models.
+
+The goal of this project is to make it easy to run a full voice + LLM pipeline locally on GPU, and make it simple enough so tinkering with it is also easy. Then to be a model organism for an agent interface. 
+
+Install should be single script, that also optionally tries to take care of cuda deps. No git lfs
+
+As long as they are optional and fun/interesting/useful, just keep piling on more models and tools
