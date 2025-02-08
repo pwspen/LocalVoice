@@ -50,14 +50,14 @@ class Kokoro:
         return audio
 
 class SileroVAD:
-    def __init__(self, send_audio_callback):
+    def __init__(self, send_audio_callback, input_device=None, max_pause=1500, vad_thresh=0.5):
         self.send_audio_callback = send_audio_callback
         self.path = "silero_vad.onnx"
         self.model = vad.VAD(model_path=str(Path.cwd() / "models" / self.path))
         self.VAD_SIZE = 50  # Milliseconds of sample for Voice Activity Detection (VAD)
-        self.VAD_THRESHOLD = 0.7  # Threshold for VAD detection
+        self.VAD_THRESHOLD = vad_thresh  # Threshold for VAD detection
         self.SAMPLE_RATE = 16000
-        self.MAX_PAUSE = 1500 # Milliseconds of pause allowed in continuous speech
+        self.MAX_PAUSE = max_pause # Milliseconds of pause allowed in continuous speech
         self.MAX_NO_CONF = self.MAX_PAUSE / self.VAD_SIZE
         self.CURR_NO_CONF = self.MAX_NO_CONF
         self.KEEP_LAST = 10 # Samples of audio (of VAD size) to keep in rolling buffer
@@ -65,18 +65,19 @@ class SileroVAD:
         self.samples: List[np.ndarray] = []
 
         self.input_stream = sd.InputStream(
+                device=input_device,
                 samplerate=self.SAMPLE_RATE,
-                channels=1,
+                channels=2,  # Use stereo channels for loopback devices
                 callback=self.audio_callback_for_sdInputStream,
                 blocksize=int(self.SAMPLE_RATE * self.VAD_SIZE / 1000),
             )
-        
         self.input_stream.start()
 
     def audio_callback_for_sdInputStream(
                 self, indata: np.ndarray, frames: int, time: Any, status: CallbackFlags
             ):
-                data = indata.copy().squeeze()  # Reduce to single channel if necessary
+                # Convert to mono by averaging channels
+                data = indata.copy().mean(axis=1)
                 vad_value = self.model.process_chunk(data)
                 vad_confidence = vad_value > self.VAD_THRESHOLD
     
@@ -89,20 +90,12 @@ class SileroVAD:
                      self.CURR_NO_CONF = 0
                      if not self.recording:
                           self.recording = True
-                        #   print('Started recording')
                 elif self.CURR_NO_CONF < self.MAX_NO_CONF:
-                    # print('No voice detected')
                     self.CURR_NO_CONF += 1
                     if self.CURR_NO_CONF == self.MAX_NO_CONF:
                          self.recording = False
-                        #  print('Stopped recording')
                          self.send_audio_callback(self.samples)
                          self.samples = []          
-                     
-
-                # self.conf = vad_value
-                # print('Processed audio')
-                # self._sample_queue.put((data, vad_confidence))
 
     def __del__(self):
          self.input_stream.stop()
@@ -172,11 +165,26 @@ class LLMProcessor:
         self.memory.clear()
 
 if __name__ == "__main__":
+    print("Available input devices:")
+    input_devices = [d for d in sd.query_devices() if d['max_input_channels'] > 0]
+    
+    # Find PipeWire device
+    pipewire_device = None
+    for i, dev in enumerate(input_devices):
+        print(f"{i}: {dev['name']}")
+        if "pipewire" in dev['name'].lower():
+            pipewire_device = i
+            
+    # If PipeWire is found, use it; otherwise prompt for selection
+    if pipewire_device is not None:
+        print(f"Automatically selected PipeWire device: {input_devices[pipewire_device]['name']}")
+        device_id = input_devices[pipewire_device]['index']
+    else:
+        devnum = int(input("PipeWire not found. Select INPUT device number: "))
+        device_id = input_devices[devnum]['index']
 
     tts = Kokoro()
-
     stt = WhisperModel("turbo", device="cuda", compute_type="float16")
-
     llm = LLMProcessor(
         provider="ollama",
         model="llama3.1:8b",
@@ -184,32 +192,26 @@ if __name__ == "__main__":
     )
 
     def call(audio_list):
-        # print('Received audio data: ', audio_list)
+        print('Transcribing...')
         if len(audio_list) < 2:
-             return
-
+            return
         arr = np.array(np.concatenate(audio_list)).squeeze()
-        # print(arr.shape)
         segs, info = stt.transcribe(audio=arr)
-        segs = list(segs) # Transcription runs here because generator
-        if len(segs):
+        segs = list(segs)
+        # print(segs)
+        if segs:
             transcribed_text = segs[0].text
             print(f'User: {transcribed_text}')
-            assistant_text = llm.process_message(transcribed_text)
-            print(f'Assistant: {assistant_text}')
-            audio = tts.generate(assistant_text)
-            sd.play(audio, samplerate=tts.rate)
-            sd.wait()
+        #     assistant_text = llm.process_message(transcribed_text)
+        #     print(f'Assistant: {assistant_text}')
+        #     audio = tts.generate(assistant_text)
+        #     sd.play(audio, samplerate=tts.rate)
+        #     sd.wait()
 
-    vad = SileroVAD(send_audio_callback=call)
+    # Initialize VAD with loopback device
+    vad = SileroVAD(send_audio_callback=call, input_device=device_id, max_pause=300)
+    print("*"*10, 'Ready to process system audio', "*"*10,)
 
-    # with Timer() as t:
-    #     segs, info = stt.transcribe(audio="output.wav")
-    #     segs = list(segs) # Transcription runs here because generator
-
-    #     print(segs[0].text)
-    # print(t.elapsed)
-    print('Ready for speech')
     try:
         while True:
             time.sleep(1)
