@@ -1,4 +1,5 @@
 import torch
+import torchaudio
 import sounddevice as sd
 from sounddevice import CallbackFlags
 import numpy as np
@@ -14,10 +15,20 @@ from langchain.prompts import PromptTemplate
 from typing import Optional, Union
 from faster_whisper import WhisperModel
 import os
+from threading import Event, Thread, Lock
+import threading
+from queue import Queue
+from dataclasses import dataclass
+from enum import Enum, auto
+
+from utils import record, select_device
 
 import vad
 from models import build_model
 from kokoro import generate
+from zonos.model import Zonos
+from zonos.conditioning import make_cond_dict
+from zonos.utils import DEFAULT_DEVICE as device
 
 class Timer:
     def __enter__(self):
@@ -28,30 +39,76 @@ class Timer:
         self.elapsed = perf_counter() - self.start
         self.readout = f'Time: {self.elapsed:.3f} seconds'
 
-class Kokoro:
+# This and TTSbase kind of just add boilerplate for now but should be useful for adding more models
+class STTBase:
     def __init__(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.rate = None
+
+    def transcribe(self) -> Tuple[List[Tuple[str, float]], dict]:
+        raise NotImplementedError
+    
+class WhisperSTT(STTBase):
+    def __init__(self, model_name: str = "turbo", compute_type: str = "float16"):
+        super().__init__()
+        self.model = WhisperModel(model_size_or_path=model_name, device=self.device, compute_type=compute_type)
+
+    def transcribe(self, audio: np.ndarray) -> Tuple[List[Tuple[str, float]], dict]:
+        return self.model.transcribe(audio)
+
+class TTSBase:
+    def __init__(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.rate = None
+
+    def generate(self) -> np.ndarray:
+        raise NotImplementedError
+
+class KokoroTTS(TTSBase):
+    def __init__(self):
+        super().__init__()
         self.rate = 24_000
-        print(f"Using device: {self.device}")
         # Build model
-        self.MODEL = build_model('models/kokoro-v0_19.pth', self.device)
+        self.model = build_model('models/kokoro-v0_19.pth', self.device)
         # Load voice
-        self.VOICE_NAME = 'af' # Default voice (50-50 mix of Bella & Sarah)
+        self.VOICE_NAME = 'bf_emma' # Default voice (50-50 mix of Bella & Sarah)
         self.VOICEPACK = torch.load(f'voices/{self.VOICE_NAME}.pt', map_location=self.device)
         self.generate("Warmup") # Loads model into memory
 
-    def generate(self, text: str, speed: float = 1.8, verbose: bool = False):
+    def generate(self, text: str, speed: float = 1.8, verbose: bool = False) -> np.ndarray:
         # Always returns 24kHz
         with Timer() as t:
-            audio, phonemes = generate(self.MODEL, text, self.VOICEPACK, lang=self.VOICE_NAME[0], speed=speed)
+            audio, phonemes = generate(self.model, text, self.VOICEPACK, lang=self.VOICE_NAME[0], speed=speed)
         duration = len(audio) / self.rate
         if verbose:
             print(f'Generated {duration:.2f} s of audio in {t.elapsed:.2f} s')
         return audio
+    
+class ZonosTTS(TTSBase):
+    def __init__(self, condfile: str):
+        super().__init__()
+        self.model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=self.device)
+        self.rate = self.model.autoencoder.sampling_rate
+        self.make_speaker(condfile=condfile)
+
+    def make_speaker(self, condfile: str):
+        wav, sampling_rate = torchaudio.load(condfile)
+        self.speaker = self.model.make_speaker_embedding(wav, sampling_rate)
+
+    def generate(self, text: str):
+        cond_dict = make_cond_dict(text, speaker=self.speaker, language="en-us")
+        conditioning = self.model.prepare_conditioning(cond_dict)
+
+        codes = self.model.generate(conditioning)
+
+        wavs = self.model.autoencoder.decode(codes).cpu()
+
+        return wavs[0]
 
 class SileroVAD:
-    def __init__(self, send_audio_callback, input_device=None, max_pause=1500, vad_thresh=0.5):
+    def __init__(self, send_audio_callback, voice_detected_callback=None, input_device=None, max_pause=1500, vad_thresh=0.5):
         self.send_audio_callback = send_audio_callback
+        self.voice_detected_callback = voice_detected_callback
         self.path = "silero_vad.onnx"
         self.model = vad.VAD(model_path=str(Path.cwd() / "models" / self.path))
         self.VAD_SIZE = 50  # Milliseconds of sample for Voice Activity Detection (VAD)
@@ -87,6 +144,9 @@ class SileroVAD:
                     self.samples.pop(0)
                 
                 if vad_confidence:
+                     if self.voice_detected_callback:
+                        self.voice_detected_callback()
+                    
                      self.CURR_NO_CONF = 0
                      if not self.recording:
                           self.recording = True
@@ -164,56 +224,120 @@ class LLMProcessor:
         """Reset the conversation memory"""
         self.memory.clear()
 
-if __name__ == "__main__":
-    print("Available input devices:")
-    input_devices = [d for d in sd.query_devices() if d['max_input_channels'] > 0]
-    
-    # Find PipeWire device
-    pipewire_device = None
-    for i, dev in enumerate(input_devices):
-        print(f"{i}: {dev['name']}")
-        if "pipewire" in dev['name'].lower():
-            pipewire_device = i
+class VoiceAssistant:
+    def __init__(self, tts, stt, llm, device_id=None, allow_interrupt=True):
+        self.allow_interrupt = allow_interrupt
+        if device_id is not None:
+            self.device_id = device_id
+        else:
+            self.device_id = select_device()
             
-    # If PipeWire is found, use it; otherwise prompt for selection
-    if pipewire_device is not None:
-        print(f"Automatically selected PipeWire device: {input_devices[pipewire_device]['name']}")
-        device_id = input_devices[pipewire_device]['index']
-    else:
-        devnum = int(input("PipeWire not found. Select INPUT device number: "))
-        device_id = input_devices[devnum]['index']
+        # Simplified interrupt handling
+        self.should_interrupt = False
+        self.interrupt_lock = Lock()
+        self.current_stream = None
 
-    tts = Kokoro()
-    stt = WhisperModel("turbo", device="cuda", compute_type="float16")
-    llm = LLMProcessor(
-        provider="ollama",
-        model="llama3.1:8b",
-        api_key=os.getenv("OPENROUTER_API_KEY")
-    )
+        # Create VAD with callback that checks speaking state
+        self.vad = SileroVAD(
+            send_audio_callback=self.receive_audio,
+            voice_detected_callback=self.handle_voice_detected,
+            input_device=device_id,
+            max_pause=300
+        )
+        self.tts: TTSBase = tts
+        self.stt: STTBase = stt
+        self.llm: LLMProcessor = llm
+        self.stop_event = Event()
 
-    def call(audio_list):
-        print('Transcribing...')
+    def receive_audio(self, audio_list):
         if len(audio_list) < 2:
             return
         arr = np.array(np.concatenate(audio_list)).squeeze()
-        segs, info = stt.transcribe(audio=arr)
+        segs, info = self.stt.transcribe(audio=arr)
         segs = list(segs)
-        # print(segs)
         if segs:
             transcribed_text = segs[0].text
             print(f'User: {transcribed_text}')
-        #     assistant_text = llm.process_message(transcribed_text)
-        #     print(f'Assistant: {assistant_text}')
-        #     audio = tts.generate(assistant_text)
-        #     sd.play(audio, samplerate=tts.rate)
-        #     sd.wait()
+            assistant_text = self.llm.process_message(transcribed_text)
+            print(f'Assistant: {assistant_text}')
+            self.play_response(assistant_text)
 
-    # Initialize VAD with loopback device
-    vad = SileroVAD(send_audio_callback=call, input_device=device_id, max_pause=300)
-    print("*"*10, 'Ready to process system audio', "*"*10,)
+    def play_audio_thread(self, audio):
+        try:
+            with self.interrupt_lock:
+                self.should_interrupt = False
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
+            # Use simple blocking play with interrupt checks
+            self.current_stream = sd.OutputStream(
+                samplerate=self.tts.rate,
+                channels=1,
+                blocksize=1024,
+                device=self.device_id
+            )
+            
+            with self.current_stream:
+                self.current_stream.start()
+                sd.play(audio, samplerate=self.tts.rate)
+                
+                while self.current_stream.active:
+                    # Check for interrupts every 50ms
+                    sd.sleep(50)
+                    with self.interrupt_lock:
+                        if self.should_interrupt:
+                            sd.stop()
+                            break
+
+                self.current_stream.stop()
+                
+        except Exception as e:
+            print(f"Error in audio playback: {e}")
+        finally:
+            with self.interrupt_lock:
+                self.should_interrupt = False
+            self.current_stream = None
+
+    def handle_voice_detected(self):
+        if not self.allow_interrupt:
+            return
+        with self.interrupt_lock:
+            if self.current_stream is not None and self.current_stream.active:
+                # print('Interrupting current speech')
+                self.should_interrupt = True
+
+    def play_response(self, text):
+        audio = self.tts.generate(text)
+        playback_thread = Thread(target=self.play_audio_thread, args=(audio,))
+        playback_thread.start()
+
+    def active(self):
+        print('Listening...')
+        try:
+            while not self.stop_event.is_set():
+                self.stop_event.wait(0.1)
+        except KeyboardInterrupt:
+            self.stop_event.set()
+
+
+if __name__ == "__main__":
+    tts = KokoroTTS()
+    stt = WhisperSTT()
+    # llm = LLMProcessor(
+    #     provider="ollama",
+    #     model="llama3.1:8b",
+    #     api_key=os.getenv("OPENROUTER_API_KEY")
+    # )
+
+    llm = LLMProcessor(
+        provider="openrouter",
+        model="anthropic/claude-3.5-sonnet",
+        api_key=os.getenv("OPENROUTER_API_KEY")
+    )
+
+    va = VoiceAssistant(
+        tts=tts,
+        stt=stt,
+        llm=llm,
+        device_id=select_device()
+    )
+
+    va.active()
