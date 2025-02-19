@@ -1,15 +1,24 @@
+# Features
+- Interrupt model at any time
+- Typical end of user speech to start of assistant speech latency: ~1s
+    - With 100 tok/s local model, no text->tts or tts->audio streaming
+- Kokoro or Zonos for STT, Whisper for TTS, Silero for VAD, any OpenAI API for LLM (Ollama, Openrouter, etc)
+
+
 # TODO
-- [ ] TTS sentence chunking
-- [ ] Interrupt detection
+- [x] TTS sentence chunking
+- [x] Interrupt detection
 - [ ] Tool use (PydanticAI)
 - [ ] LLaSa integration (any voice, any persona)
+- [x] Zonos integration
 - [ ] vision LLM / YOLO integration
 - [ ] Biasing voice with emotion
 - [ ] OpenHands CLI integration
 - [ ] Life / goals coach module
 
 - [ ] Wake word, conversation end modes
-- [ ] Cache warming modes
+- [ ] text -> tts streaming
+- [ ] tts -> audio streaming (in chunks for now)
 - [ ] Avg latency auto tests
 - [ ] Audio preprocessing/filtering
 - [ ] Visual interface - openwebui?
