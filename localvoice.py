@@ -24,14 +24,13 @@ import re
 import nltk
 nltk.download('punkt')
 
-from utils import record, select_device
-
 import vad
 from models import build_model
 from kokoro import generate
 from zonos.model import Zonos
 from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE as device
+from utils import select_device
 
 class Timer:
     def __enter__(self):
@@ -114,6 +113,166 @@ class ZonosTTS(TTSBase):
             audio = np.concatenate((audio, chunk_audio))
         return audio
 
+class LlasaTTS(TTSBase):
+    def __init__(self, 
+                 llm_path: str = "HKUSTAudio/Llasa-3B",
+                 codec_model_path: str = "HKUST-Audio/xcodec2",
+                 condfile: str = "Anna.wav",
+                 prompt_text: str = "A chance to leave him alone, but... No. She just wanted to see him again. Anna, you don't know how it feels to lose a sister. Anna, I'm sorry, but your father asked me not to tell you anything.",
+                 device: str = None,
+                 max_length: int = 2048,
+                 temperature: float = 0.8,
+                 top_p: float = 1.0):
+        super().__init__()
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from xcodec2.modeling_xcodec2 import XCodec2Model
+        import torch
+        import soundfile as sf
+        import librosa
+        import re
+
+        # Set device if not provided
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+            
+        self.rate = 16000  # Llasa uses 16kHz sampling rate
+        self.max_length = max_length
+        self.temperature = temperature
+        self.top_p = top_p
+        self.prompt_text = prompt_text
+        
+        # Initialize models
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_path)
+        self.llm = AutoModelForCausalLM.from_pretrained(llm_path).eval().to(self.device)
+        self.codec = XCodec2Model.from_pretrained(codec_model_path).eval().to(self.device)
+        
+        # Load prompt data
+        self.prompt_wav = self._load_audio(condfile)
+
+    def _load_audio(self, path: str) -> torch.Tensor:
+        """Load and prepare audio file for the model"""
+        import torch
+        import soundfile as sf
+        import librosa
+        
+        # Load audio file with original sample rate
+        waveform, sr = sf.read(path)
+        
+        # Resample to 16kHz if necessary
+        if sr != 16000:
+            # Using librosa for resampling
+            waveform = librosa.resample(y=waveform, orig_sr=sr, target_sr=16000)
+        
+        return torch.from_numpy(waveform).float().unsqueeze(0).to(self.device)
+
+    def _ids_to_speech_tokens(self, speech_ids: list) -> list:
+        """Convert speech IDs to token format expected by the model"""
+        return [f"<|s_{sid}|>" for sid in speech_ids]
+
+    def _extract_speech_ids(self, tokens: list) -> list:
+        """Extract speech IDs from token strings"""
+        return [int(t[4:-2]) for t in tokens if t.startswith('<|s_') and t.endswith('|>')]
+
+    def set_prompt(self, prompt_audio_path: str, prompt_text: str):
+        """Update the conditioning prompt audio and text"""
+        self.prompt_wav = self._load_audio(prompt_audio_path)
+        self.prompt_text = prompt_text
+
+    def generate(self, text: str, verbose: bool = False) -> np.ndarray:
+        """Generate speech for the given text using the Llasa model"""
+        import torch
+        import time
+        import numpy as np
+        import re
+        
+        start_time = time.time()
+        input_text = self.prompt_text + text
+
+        with torch.no_grad():
+            # Encode prompt audio
+            vq_code = self.codec.encode_code(self.prompt_wav)[0, 0, :]
+            speech_prefix = self._ids_to_speech_tokens(vq_code.tolist())
+
+            # Format input text
+            formatted_text = (
+                f"<|TEXT_UNDERSTANDING_START|>{input_text}<|TEXT_UNDERSTANDING_END|>"
+            )
+
+            # Create chat template
+            chat = [
+                {"role": "user", "content": "Convert the text to speech:" + formatted_text},
+                {"role": "assistant", "content": f"<|SPEECH_GENERATION_START|>{''.join(speech_prefix)}"}
+            ]
+            
+            # Tokenize and generate
+            input_ids = self.tokenizer.apply_chat_template(
+                chat, tokenize=True, return_tensors='pt', continue_final_message=True
+            ).to(self.device)
+            
+            outputs = self.llm.generate(
+                input_ids,
+                max_length=self.max_length,
+                eos_token_id=self.tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>'),
+                do_sample=True,
+                top_p=self.top_p,
+                temperature=self.temperature,
+            )
+
+            # Process output
+            generated_ids = outputs[0][input_ids.shape[1]:-1]
+            speech_tokens = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            speech_ids = self._extract_speech_ids(speech_tokens)
+            
+            # Decode to audio
+            speech_tensor = torch.tensor(speech_ids, device=self.device).unsqueeze(0).unsqueeze(0)
+            waveform = self.codec.decode_code(speech_tensor)[0, 0, :].cpu().numpy()
+
+        generation_time = time.time() - start_time
+
+        if verbose:
+            audio_length = len(waveform) / self.rate  # Calculate duration in seconds
+            print(f"Generated speech in {generation_time:.2f} seconds")
+            print(f"Audio length: {audio_length:.2f} seconds")
+
+        return waveform
+
+    def generate_batched(self, text: str, verbose: bool = False) -> np.ndarray:
+        """Generate speech by splitting text into sentences for better quality"""
+        import numpy as np
+        import re
+        
+        combined_waveform = np.array([])
+        total_time = 0.0
+        
+        # Simple sentence splitting logic
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        for sentence in sentences:
+            if not sentence.strip():
+                continue  # Skip empty strings
+                
+            start_time = time.time()
+            waveform = self.generate(
+                text=sentence,
+                verbose=verbose
+            )
+            total_time += time.time() - start_time
+            
+            # Concatenate waveforms
+            combined_waveform = np.concatenate(
+                (combined_waveform, waveform)
+            ) if combined_waveform.size else waveform
+
+        if verbose:
+            audio_length = len(combined_waveform) / self.rate
+            print(f"Total generation time: {total_time:.2f} seconds")
+            print(f"Combined audio length: {audio_length:.2f} seconds")
+
+        return combined_waveform
+
+
 class SileroVAD:
     def __init__(self, send_audio_callback, voice_detected_callback=None, input_device=None, max_pause=1500, vad_thresh=0.5):
         self.send_audio_callback = send_audio_callback
@@ -169,7 +328,7 @@ class SileroVAD:
     def __del__(self):
          self.input_stream.stop()
 
-class LLMProcessor:
+class LLM:
     def __init__(self, 
                  provider: str = "openrouter",
                  model: str = "mistralai/mistral-7b-instruct",
@@ -234,10 +393,10 @@ class LLMProcessor:
         self.memory.clear()
 
 class VoiceAssistant:
-    def __init__(self, tts, stt, llm, device_id=None, allow_interrupt=True):
+    def __init__(self, tts: TTSBase, stt: STTBase, llm: LLM, input_device=None, allow_interrupt=True):
         self.allow_interrupt = allow_interrupt
-        if device_id is not None:
-            self.device_id = device_id
+        if input_device is not None:
+            self.device_id = input_device
         else:
             self.device_id = select_device()
             
@@ -250,12 +409,12 @@ class VoiceAssistant:
         self.vad = SileroVAD(
             send_audio_callback=self.receive_audio,
             voice_detected_callback=self.handle_voice_detected,
-            input_device=device_id,
+            input_device=input_device,
             max_pause=300
         )
         self.tts: TTSBase = tts
         self.stt: STTBase = stt
-        self.llm: LLMProcessor = llm
+        self.llm: LLM = llm
         self.stop_event = Event()
         self.processing_thread = None
         self.processing_cancelled = False
@@ -362,29 +521,3 @@ class VoiceAssistant:
                 self.stop_event.wait(0.1)
         except KeyboardInterrupt:
             self.stop_event.set()
-
-
-if __name__ == "__main__":
-    tts = KokoroTTS()
-    # tts = ZonosTTS(condfile="skulls.wav")
-    stt = WhisperSTT()
-    llm = LLMProcessor(
-        provider="ollama",
-        model="llama3.1:8b",
-        api_key=os.getenv("OPENROUTER_API_KEY")
-    )
-
-    # llm = LLMProcessor(
-    #     provider="openrouter",
-    #     model="anthropic/claude-3.5-sonnet",
-    #     api_key=os.getenv("OPENROUTER_API_KEY")
-    # )
-
-    va = VoiceAssistant(
-        tts=tts,
-        stt=stt,
-        llm=llm,
-        device_id=select_device()
-    )
-
-    va.active()
